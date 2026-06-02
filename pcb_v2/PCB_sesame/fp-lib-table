@@ -1,0 +1,4 @@
+(fp_lib_table
+  (version 7)
+  (lib (name "simbolo_crea")(type "KiCad")(uri "${KIPRJMOD}/simbolo_crea.pretty")(options "")(descr ""))
+)
