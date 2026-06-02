@@ -1,0 +1,541 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <Wire.h>
+#include <ESP32Servo.h>
+// #include <Adafruit_GFX.h>         // COMENTADO - Sin pantalla
+// #include <Adafruit_SSD1306.h>     // COMENTADO - Sin pantalla
+#include "face-bitmaps.h"
+#include "movement-sequences.h"
+#include "captive-portal.h"
+
+// --- Access Point Configuration ---
+// This is the network the Robot will create
+#define AP_SSID  "Sesame-Controller"
+#define AP_PASS  "12345678" // Must be at least 8 characters
+
+// COMENTADO - Sin pantalla
+// #define SCREEN_WIDTH 128
+// #define SCREEN_HEIGHT 64
+// #define OLED_RESET -1
+// #define OLED_I2C_ADDR 0x3C
+
+// I2C Pins for Distro Board
+//#define I2C_SDA 21
+//#define I2C_SCL 22
+
+// I2C Pins for S2 Mini Board
+#define I2C_SDA 33
+#define I2C_SCL 35
+
+
+// DNS Server for Captive Portal
+DNSServer dnsServer;
+const byte DNS_PORT = 53;
+
+// COMENTADO - Sin pantalla
+// Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+WebServer server(80);
+
+// Global state for animations
+String currentCommand = "";
+String currentFaceName = "defualt";
+const unsigned char* const* currentFaceFrames = nullptr;
+uint8_t currentFaceFrameCount = 0;
+uint8_t currentFaceFrameIndex = 0;
+unsigned long lastFaceFrameMs = 0;
+int faceFps = 8;
+FaceAnimMode currentFaceMode = FACE_ANIM_LOOP;
+int8_t faceFrameDirection = 1;
+bool faceAnimFinished = false;
+int currentFaceFps = 0;
+bool idleActive = false;
+bool idleBlinkActive = false;
+unsigned long nextIdleBlinkMs = 0;
+uint8_t idleBlinkRepeatsLeft = 0;
+
+// WiFi Info Scrolling
+unsigned long lastInputTime = 0;
+bool firstInputReceived = false;
+bool showingWifiInfo = false;
+int wifiScrollPos = 0;
+unsigned long lastWifiScrollMs = 0;
+String wifiInfoText = "";
+
+// Servo Pins for Distro Board
+// ======================================================================
+// Pin numbers are coorisponding to the ESP32 GPIO pins and may differ based on which board you use.
+// If you are using a different board, please adjust the servoPins array accordingly.
+// ======================================================================
+Servo servos[8];
+// Sesame Distro Board Pinout
+//const int servoPins[8] = {15, 2, 23, 19, 4, 16, 17, 18};
+
+// Lolin S2 Mini Pinout
+const int servoPins[8] = {1, 2, 4, 6, 8, 10, 13, 14};
+
+// Subtrim values for each servo (offset in degrees)
+int8_t servoSubtrim[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+
+
+// Animation constants
+int frameDelay = 100;
+int walkCycles = 10;
+int motorCurrentDelay = 20; // ms delay between motor movements to prevent over-current
+
+struct FaceEntry {
+  const char* name;
+  const unsigned char* const* frames;
+  uint8_t maxFrames;
+};
+
+static const uint8_t MAX_FACE_FRAMES = 6;
+
+#define MAKE_FACE_FRAMES(name) \
+  const unsigned char* const face_##name##_frames[] = { \
+    epd_bitmap_##name, epd_bitmap_##name##_1, epd_bitmap_##name##_2, \
+    epd_bitmap_##name##_3, epd_bitmap_##name##_4, epd_bitmap_##name##_5 \
+  };
+
+#define X(name) MAKE_FACE_FRAMES(name)
+FACE_LIST
+#undef X
+#undef MAKE_FACE_FRAMES
+
+const FaceEntry faceEntries[] = {
+#define X(name) { #name, face_##name##_frames, MAX_FACE_FRAMES },
+  FACE_LIST
+#undef X
+  { "default", face_defualt_frames, MAX_FACE_FRAMES }
+};
+
+struct FaceFpsEntry {
+  const char* name;
+  uint8_t fps;
+};
+
+const FaceFpsEntry faceFpsEntries[] = {
+  { "walk", 1 },
+  { "rest", 1 },
+  { "swim", 1 },
+  { "dance", 1 },
+  { "wave", 1 },
+  { "point", 5 },
+  { "stand", 1 },
+  { "cute", 1 },
+  { "pushup", 1 },
+  { "freaky", 1 },
+  { "bow", 1 },
+  { "worm", 1 },
+  { "shake", 1 },
+  { "shrug", 1 },
+  { "dead", 2 },
+  { "crab", 1 },
+  { "idle", 1 },
+  { "idle_blink", 7 },
+  { "defualt", 1 },
+};
+
+
+// Prototypes
+void setServoAngle(uint8_t channel, int angle);
+void updateFaceBitmap(const unsigned char* bitmap);
+void setFace(const String& faceName);
+void setFaceMode(FaceAnimMode mode);
+void setFaceWithMode(const String& faceName, FaceAnimMode mode);
+void updateAnimatedFace();
+void delayWithFace(unsigned long ms);
+void enterIdle();
+void exitIdle();
+void updateIdleBlink();
+int getFaceFpsForName(const String& faceName);
+bool pressingCheck(String cmd, int ms);
+void handleGetSettings();
+void handleSetSettings();
+void updateWifiInfoScroll();
+void recordInput();
+
+void handleRoot() {
+  server.send(200, "text/html", index_html);
+}
+
+void handleCommandWeb() {
+  // We send 200 OK immediately so the web browser doesn't hang waiting for animation to finish
+  if (server.hasArg("pose")) {
+    currentCommand = server.arg("pose");
+    recordInput();
+    exitIdle();
+    server.send(200, "text/plain", "OK"); 
+  } 
+  else if (server.hasArg("go")) {
+    currentCommand = server.arg("go");
+    recordInput();
+    exitIdle();
+    server.send(200, "text/plain", "OK");
+  } 
+  else if (server.hasArg("stop")) {
+    currentCommand = "";
+    recordInput();
+    server.send(200, "text/plain", "OK");
+  }
+  else if (server.hasArg("motor") && server.hasArg("value")) {
+    int motorNum = server.arg("motor").toInt();
+    int angle = server.arg("value").toInt();
+    if (motorNum >= 1 && motorNum <= 8 && angle >= 0 && angle <= 180) {
+      setServoAngle(motorNum - 1, angle); // Convert 1-based to 0-based index
+      recordInput();
+      server.send(200, "text/plain", "OK");
+    } else {
+      server.send(400, "text/plain", "Invalid motor or angle");
+    }
+  }
+  else {
+    server.send(400, "text/plain", "Bad Args");
+  }
+}
+
+void handleGetSettings() {
+  String json = "{";
+  json += "\"frameDelay\":" + String(frameDelay) + ",";
+  json += "\"walkCycles\":" + String(walkCycles) + ",";
+  json += "\"motorCurrentDelay\":" + String(motorCurrentDelay) + ",";
+  json += "\"faceFps\":" + String(faceFps);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleSetSettings() {
+  if (server.hasArg("frameDelay")) frameDelay = server.arg("frameDelay").toInt();
+  if (server.hasArg("walkCycles")) walkCycles = server.arg("walkCycles").toInt();
+  if (server.hasArg("motorCurrentDelay")) motorCurrentDelay = server.arg("motorCurrentDelay").toInt();
+  if (server.hasArg("faceFps")) faceFps = (int)max(1L, server.arg("faceFps").toInt());
+  server.send(200, "text/plain", "OK");
+}
+
+void setup() {
+  Serial.begin(115200);
+  randomSeed(micros());
+  
+  // COMENTADO - Sin pantalla
+  // Wire.begin(I2C_SDA, I2C_SCL);
+
+  // OLED Init - COMENTADO
+  /*
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDR)) {
+    Serial.println(F("SSD1306 allocation failed."));
+    while (1);
+  }
+  
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0,0);
+  display.println(F("Creating WiFi..."));
+  display.display();
+  */
+  
+  Serial.println(F("Creating WiFi..."));
+
+  // --- ACCESS POINT CONFIGURATION ---
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASS);
+  IPAddress myIP = WiFi.softAPIP();
+  
+  Serial.print("AP Created. IP: ");
+  Serial.println(myIP);
+
+  // Build WiFi info text for scrolling
+  wifiInfoText = "Connect to WiFi: " + String(AP_SSID) + "  |  Pass: " + String(AP_PASS) + "  |  Captive Portal will auto-open!  |  ";
+  
+  // Initialize input tracking
+  lastInputTime = millis();
+  firstInputReceived = false;
+  showingWifiInfo = false;
+
+  // Start DNS Server for Captive Portal
+  // This redirects ALL domain requests to the ESP32's IP
+  dnsServer.start(DNS_PORT, "*", myIP);
+
+  // Web Server Routes
+  server.on("/", handleRoot);
+  server.on("/cmd", handleCommandWeb);
+  server.on("/getSettings", handleGetSettings);
+  server.on("/setSettings", handleSetSettings);
+  
+  // Catch-all route for captive portal
+  // This ensures any URL redirects to the controller page
+  server.onNotFound(handleRoot);
+  
+  server.begin();
+
+  // PWM Init
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+  
+  for (int i = 0; i < 8; i++) {
+    servos[i].setPeriodHertz(50);
+    // Map 0-180 to approx 732-2929us
+    servos[i].attach(servoPins[i], 732, 2929);
+  }
+  delay(10);
+  
+  // Show rest face on startup without moving motors
+  // setFace("rest");  // COMENTADO - Sin pantalla
+  
+  Serial.println(F("HTTP server & Captive Portal started."));
+}
+
+void loop() {
+  // Process DNS requests for captive portal
+  dnsServer.processNextRequest();
+  
+  server.handleClient();
+  // updateAnimatedFace();     // COMENTADO - Sin pantalla
+  // updateIdleBlink();        // COMENTADO - Sin pantalla
+  // updateWifiInfoScroll();   // COMENTADO - Sin pantalla
+
+  if (currentCommand != "") {
+    String cmd = currentCommand;
+    if (cmd == "forward") runWalkPose();
+    else if (cmd == "backward") runWalkBackward();
+    else if (cmd == "left") runTurnLeft();
+    else if (cmd == "right") runTurnRight();
+    else if (cmd == "rest") { runRestPose(); if (currentCommand == "rest") currentCommand = ""; }
+    else if (cmd == "stand") { runStandPose(1); if (currentCommand == "stand") currentCommand = ""; }
+    else if (cmd == "wave") runWavePose();
+    else if (cmd == "dance") runDancePose();
+    else if (cmd == "swim") runSwimPose();
+    else if (cmd == "point") runPointPose();
+    else if (cmd == "pushup") runPushupPose();
+    else if (cmd == "bow") runBowPose();
+    else if (cmd == "cute") runCutePose();
+    else if (cmd == "freaky") runFreakyPose();
+    else if (cmd == "worm") runWormPose();
+    else if (cmd == "shake") runShakePose();
+    else if (cmd == "shrug") runShrugPose();
+    else if (cmd == "dead") runDeadPose();
+    else if (cmd == "crab") runCrabPose();
+  }
+  
+  // Serial CLI for debugging (can be used to diagnose servo position issues and wiring)
+  if (Serial.available()) {
+    static char command_buffer[32];
+    static byte buffer_pos = 0;
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (buffer_pos > 0) {
+        command_buffer[buffer_pos] = '\0';
+        int motorNum, angle;
+        recordInput();
+        if(strcmp(command_buffer, "run walk") == 0 || strcmp(command_buffer, "rn wf") == 0) { currentCommand = "forward"; runWalkPose(); currentCommand = ""; }
+        else if(strcmp(command_buffer, "rn wb") == 0) { currentCommand = "backward"; runWalkBackward(); currentCommand = ""; }
+        else if(strcmp(command_buffer, "rn tl") == 0) { currentCommand = "left"; runTurnLeft(); currentCommand = ""; }
+        else if(strcmp(command_buffer, "rn tr") == 0) { currentCommand = "right"; runTurnRight(); currentCommand = ""; }
+        else if(strcmp(command_buffer, "run rest") == 0 || strcmp(command_buffer, "rn rs") == 0) runRestPose();
+        else if(strcmp(command_buffer, "run stand") == 0 || strcmp(command_buffer, "rn st") == 0) runStandPose(1);
+        else if(strcmp(command_buffer, "rn wv") == 0) { currentCommand = "wave"; runWavePose(); }
+        else if(strcmp(command_buffer, "rn dn") == 0) { currentCommand = "dance"; runDancePose(); }
+        else if(strcmp(command_buffer, "rn sw") == 0) { currentCommand = "swim"; runSwimPose(); }
+        else if(strcmp(command_buffer, "rn pt") == 0) { currentCommand = "point"; runPointPose(); }
+        else if(strcmp(command_buffer, "rn pu") == 0) { currentCommand = "pushup"; runPushupPose(); }
+        else if(strcmp(command_buffer, "rn bw") == 0) { currentCommand = "bow"; runBowPose(); }
+        else if(strcmp(command_buffer, "rn ct") == 0) { currentCommand = "cute"; runCutePose(); }
+        else if(strcmp(command_buffer, "rn fk") == 0) { currentCommand = "freaky"; runFreakyPose(); }
+        else if(strcmp(command_buffer, "rn wm") == 0) { currentCommand = "worm"; runWormPose(); }
+        else if(strcmp(command_buffer, "rn sk") == 0) { currentCommand = "shake"; runShakePose(); }
+        else if(strcmp(command_buffer, "rn sg") == 0) { currentCommand = "shrug"; runShrugPose(); }
+        else if(strcmp(command_buffer, "rn dd") == 0) { currentCommand = "dead"; runDeadPose(); }
+        else if(strcmp(command_buffer, "rn cb") == 0) { currentCommand = "crab"; runCrabPose(); }
+        else if (strcmp(command_buffer, "subtrim") == 0 || strcmp(command_buffer, "st") == 0) {
+          Serial.println("Subtrim values:");
+          for (int i = 0; i < 8; i++) {
+            Serial.print("Motor "); Serial.print(i); Serial.print(": ");
+            if (servoSubtrim[i] >= 0) Serial.print("+");
+            Serial.println(servoSubtrim[i]);
+          }
+        }
+        else if (strcmp(command_buffer, "subtrim save") == 0 || strcmp(command_buffer, "st save") == 0) {
+          Serial.println("Copy and paste this into your code:");
+          Serial.print("int8_t servoSubtrim[8] = {");
+          for (int i = 0; i < 8; i++) {
+            Serial.print(servoSubtrim[i]);
+            if (i < 7) Serial.print(", ");
+          }
+          Serial.println("};");
+        }
+        else if (strncmp(command_buffer, "subtrim reset", 13) == 0 || strncmp(command_buffer, "st reset", 8) == 0) {
+          for (int i = 0; i < 8; i++) servoSubtrim[i] = 0;
+          Serial.println("All subtrim values reset to 0");
+        }
+        else if (strncmp(command_buffer, "subtrim ", 8) == 0 || strncmp(command_buffer, "st ", 3) == 0) {
+          const char* params = (command_buffer[1] == 't') ? command_buffer + 3 : command_buffer + 8;
+          int trimMotor, trimValue;
+          if (sscanf(params, "%d %d", &trimMotor, &trimValue) == 2) {
+            if (trimMotor >= 0 && trimMotor < 8) {
+              if (trimValue >= -90 && trimValue <= 90) {
+                servoSubtrim[trimMotor] = trimValue;
+                Serial.print("Motor "); Serial.print(trimMotor); Serial.print(" subtrim set to ");
+                if (trimValue >= 0) Serial.print("+");
+                Serial.println(trimValue);
+              } else {
+                Serial.println("Subtrim value must be between -90 and +90");
+              }
+            } else {
+              Serial.println("Invalid motor number (0-7)");
+            }
+          }
+        }
+        else if (strncmp(command_buffer, "all ", 4) == 0) {
+             if (sscanf(command_buffer + 4, "%d", &angle) == 1) {
+                 for (int i = 0; i < 8; i++) setServoAngle(i, angle);
+                 Serial.print("All servos set to "); Serial.println(angle);
+             }
+        }
+        else if (sscanf(command_buffer, "%d %d", &motorNum, &angle) == 2) {
+             if (motorNum >= 0 && motorNum < 8) {
+                 setServoAngle(motorNum, angle);
+                 Serial.print("Servo "); Serial.print(motorNum); Serial.print(" set to "); Serial.println(angle);
+             } else {
+                 Serial.println("Invalid motor number (0-7)");
+             }
+        }
+        buffer_pos = 0;
+      }
+    } else if (buffer_pos < sizeof(command_buffer) - 1) {
+      command_buffer[buffer_pos++] = c;
+    }
+  }
+}
+
+// ============================================
+// FUNCIONES VACÍAS - SIN PANTALLA
+// ============================================
+
+void updateFaceBitmap(const unsigned char* bitmap) {
+  // Sin pantalla, no hace nada
+}
+
+void setFace(const String& faceName) {
+  // Sin pantalla, solo actualiza el nombre
+  currentFaceName = faceName;
+}
+
+void setFaceMode(FaceAnimMode mode) {
+  // Sin pantalla, solo actualiza el modo
+  currentFaceMode = mode;
+}
+
+void setFaceWithMode(const String& faceName, FaceAnimMode mode) {
+  setFaceMode(mode);
+  setFace(faceName);
+}
+
+void updateAnimatedFace() {
+  // Sin pantalla, no hace nada
+}
+
+void updateIdleBlink() {
+  // Sin pantalla, no hace nada
+}
+
+void updateWifiInfoScroll() {
+  // Sin pantalla, no hace nada
+}
+
+// ============================================
+// FUNCIONES COMENTADAS (no necesarias sin pantalla)
+// ============================================
+
+/*
+uint8_t countFrames(const unsigned char* const* frames, uint8_t maxFrames) {
+  if (frames == nullptr || frames[0] == nullptr) return 0;
+  uint8_t count = 0;
+  for (uint8_t i = 0; i < maxFrames; i++) {
+    if (frames[i] == nullptr) break;
+    count++;
+  }
+  return count;
+}
+
+int getFaceFpsForName(const String& faceName) {
+  for (size_t i = 0; i < (sizeof(faceFpsEntries) / sizeof(faceFpsEntries[0])); i++) {
+    if (faceName.equalsIgnoreCase(faceFpsEntries[i].name)) {
+      return faceFpsEntries[i].fps;
+    }
+  }
+  return faceFps;
+}
+
+void scheduleNextIdleBlink(unsigned long minMs, unsigned long maxMs) {
+  unsigned long now = millis();
+  unsigned long interval = (unsigned long)random(minMs, maxMs);
+  nextIdleBlinkMs = now + interval;
+}
+
+void enterIdle() {
+  idleActive = true;
+  idleBlinkActive = false;
+  idleBlinkRepeatsLeft = 0;
+  setFaceWithMode("idle", FACE_ANIM_BOOMERANG);
+  scheduleNextIdleBlink(3000, 7000);
+}
+
+void exitIdle() {
+  idleActive = false;
+  idleBlinkActive = false;
+}
+*/
+
+void delayWithFace(unsigned long ms) {
+  unsigned long start = millis();
+  while (millis() - start < ms) {
+    // updateAnimatedFace();  // COMENTADO - Sin pantalla
+    server.handleClient();
+    dnsServer.processNextRequest();
+    delay(5);
+  }
+}
+
+// ====== HELPERS ======
+void setServoAngle(uint8_t channel, int angle) { 
+  if (channel < 8) {
+    int adjustedAngle = constrain(angle + servoSubtrim[channel], 0, 180);
+    servos[channel].write(adjustedAngle);
+    delayWithFace(motorCurrentDelay);
+  }
+}
+
+bool pressingCheck(String cmd, int ms) {
+  unsigned long start = millis();
+  while (millis() - start < ms) {
+    server.handleClient();
+    dnsServer.processNextRequest();
+    // updateAnimatedFace();  // COMENTADO - Sin pantalla
+    if (currentCommand != cmd) {
+      runStandPose(1);
+      return false;
+    }
+    yield();
+  }
+  return true;
+}
+
+void recordInput() {
+  lastInputTime = millis();
+  if (!firstInputReceived) {
+    firstInputReceived = true;
+    showingWifiInfo = false;
+  }
+}
+
+void enterIdle() {
+  // Versión simplificada sin pantalla
+  idleActive = true;
+}
+
+void exitIdle() {
+  // Versión simplificada sin pantalla
+  idleActive = false;
+}
